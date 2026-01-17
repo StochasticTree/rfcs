@@ -10,9 +10,9 @@ While most contributions to [stochtree](https://github.com/StochasticTree/stocht
     - Modifications to data structures aimed at performance improvements, or
     - Changes to the API / class model with the goal of increased flexibility / expressiveness
 
-## Process
+## Writing New RFCs
 
-stochtree's process is a (lightweight) adaptation of other open source RFC processes 
+stochtree's RFC process is a (lightweight) adaptation of other open source RFC processes 
 (see [pytorch](https://github.com/pytorch/rfcs) and [rust](https://github.com/rust-lang/rfcs) for examples).
 
 In order to begin an RFC,
@@ -26,3 +26,7 @@ After some discussion and iteration, we will come to decision on whether to acce
 If the proposal is accepted, we will renumber `0000-your-feature-name.md` based on the PR number, merge the PR, and open a parallel "tracking" issue in the [stochtree](https://github.com/StochasticTree/stochtree) repo. 
 If the changes are significant, we may even assign sub-issues and track the changes in a Github project board.
 At this point, the work begins on implementing the feature and the RFC is preserved here as a design "record" for future reference.
+
+## Commenting on Existing RFCs
+
+You can weigh in on existing RFCs, either by opening an issue in this repo or by commenting on the RFC's corresponding tracking issue in the stochtree repo. Feedback is generally appreciated -- this process is intended to provide **more** opportunity for discussion and insight into stochtree's design process, not less.
