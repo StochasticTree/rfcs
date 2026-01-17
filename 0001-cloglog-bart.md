@@ -1,12 +1,12 @@
 # Supporting cloglog Link in BART Interface
 
-PR link: [TBD]
+PR link: https://github.com/StochasticTree/rfcs/pull/1
 
-Tracking issue: [TBD]
+Tracking issue: https://github.com/StochasticTree/stochtree/issues/261
 
 # Overview
 
-Adds a new link function for modeling unbalanced ordinal responses, which users can request directly from the `stochtree::bart()` interface in R and the `BARTModel()` interface in Python
+Adds a new link function for modeling ordinal responses, which users can request directly from the `stochtree::bart()` interface in R and the `BARTModel()` interface in Python
 
 # Motivation
 
@@ -81,7 +81,7 @@ What we will **not** track and return:
 Right now, the `predict` function / method in both R and Python contains a `scale` argument whose valid options are `'linear'` and `'probability'`. We will modify this to more closely match the spirit / style of existing GLM implementations. For quick overview:
 
 - [the `glm` function in base R](https://stat.ethz.ch/R-manual/R-devel/RHOME/library/stats/html/predict.glm.html) uses `type = 'response'` for inverse-link scale and `type = 'link'` for linear scale
-- [the `GLM` class in statsmodels (Python)](https://www.statsmodels.org/stable/generated/statsmodels.genmod.generalized_linear_model.GLM.predict.html#statsmodels.genmod.generalized_linear_model.GLM.predict.which) uses `which = 'mean'` for inverse-link scale and `which = 'linear'` for raw linear scale
+- [the `GLM` class in statsmodels (Python)](https://www.statsmodels.org/stable/generated/statsmodels.genmod.generalized_linear_model.GLM.predict.html#statsmodels.genmod.generalized_linear_model.GLM.predict.which) uses `which = 'mean'` for inverse-link scale and `which = 'linear'` for linear scale
 
 We will accept either `'response'` or `'mean'` for inverse-link scale and `'link'` or `'linear'` for linear scale. We will also continue to accept `'probability'` for probit models, with a deprecation warning that it will be phased out in future versions.
 
