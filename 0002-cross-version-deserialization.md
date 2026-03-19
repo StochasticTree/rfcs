@@ -1,6 +1,6 @@
 # Cross-Version Deserialization for BART and BCF Models
 
-PR link: [TBD]
+PR link: [#2](https://github.com/StochasticTree/rfcs/pull/2)
 
 Tracking issue: [TBD]
 
