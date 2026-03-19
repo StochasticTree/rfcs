@@ -2,7 +2,7 @@
 
 PR link: [#2](https://github.com/StochasticTree/rfcs/pull/2)
 
-Tracking issue: [TBD]
+Tracking issue: [StochasticTree/stochtree#323](https://github.com/StochasticTree/stochtree/issues/323)
 
 # Overview
 
