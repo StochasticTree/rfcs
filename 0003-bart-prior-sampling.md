@@ -1,6 +1,6 @@
 # Sampling from the BART Prior
 
-PR link: [TBD]
+PR link: [#3](https://github.com/StochasticTree/rfcs/pull/3)
 
 Tracking issue: [StochasticTree/stochtree#200](https://github.com/StochasticTree/stochtree/issues/200)
 
