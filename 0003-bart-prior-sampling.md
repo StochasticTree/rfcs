@@ -1,15 +1,15 @@
 # Sampling from the BART Prior
 
-PR link: [#3](https://github.com/StochasticTree/rfcs/pull/3)
+PR link: [#4](https://github.com/StochasticTree/rfcs/pull/4)
 
 Tracking issue: [StochasticTree/stochtree#200](https://github.com/StochasticTree/stochtree/issues/200)
 
 # Overview
 
-Add first-class support for sampling from the BART prior — the distribution over sum-of-trees functions before any data is observed. This is accomplished in two phases: 
+Add first-class support for sampling from the BART prior — the distribution over sum-of-trees functions before any data is observed. This is accomplished in two phases:
 
-1. exposing **observation weights** ("case weights") in the high-level `bart()` and `bcf()` interfaces, and 
-2. providing a convenience wrapper `bart_prior_sample()` (Python) / `bart_sample_prior()` (R) that hides the mechanics from users who only need prior draws.
+1. Exposing **observation weights** ("case weights") in the high-level `bart()` and `bcf()` interfaces. Weights are broadly useful independent of prior sampling (survey-weighted regression, importance resampling, subgroup upweighting).
+2. A dedicated **direct C++ prior sampler** (`SampleForestFromPrior`) that samples tree structures from the branching process prior and leaf parameters from `N(0, σ²_μ)` — no outcome data, no MCMC, independent draws. Thin wrappers `bart_prior_sample()` (Python) / `sampleBARTPrior()` (R) expose this to users.
 
 # Motivation
 
@@ -69,6 +69,7 @@ The `bcf()` function should apply weights to both `mu_forest_data` and `tau_fore
 ### Serialization
 
 Observation weights are not part of the model — they are properties of the training data and do not need to be serialized to JSON. No changes to the serialization layer are required.
+
 ### Interactions
 
 Most other stochtree modeling features should be compatible with general-purpose observation weights, though we need to be careful to accumulate weighted sufficient statistics for other model terms.
@@ -77,103 +78,95 @@ Variance forests and discrete outcome models should at minimum raise a warning a
 
 ---
 
-## Phase 2 — Prior sampling convenience function
+## Phase 2 — Direct C++ prior sampler
 
 ### Approach
 
-The cleanest way to sample from the BART prior within the existing MCMC framework is to run the sampler on a dataset where all observation weights are zero. With `w_i = 0` for all `i`:
+Phase 2 implements a standalone prior sampler that bypasses the MCMC machinery entirely. Rather than running the sampler on a degenerate dataset, a dedicated C++ function samples tree structures directly from the branching process prior and draws leaf parameters from their prior distribution.
 
-- **Split evaluation**: all weighted sufficient statistics are zero, so the Metropolis-Hastings acceptance ratio for grow/prune/change steps reduces to a ratio of tree structure prior probabilities only. The data have no effect on which tree topologies are sampled.
-- **Leaf parameter sampling**: the posterior `p(μ | data, tree) = p(μ | tree)` because the likelihood term vanishes. Leaves are drawn from their prior $N(0, \sigma^2_{\mu})$.
-- **Global variance $\sigma^2$**: with zero total weight, $\sigma^2$ is not informed by the data and samples from its IG prior throughout. This is the desired behavior — the marginal prior over $\sigma^2$ is preserved.
+**Why not zero-weight MCMC (originally planned):**
 
-The dummy dataset `y_train = 0` (or any constant) with `X_train` drawn from the user's intended covariate distribution is sufficient.
+The original Phase 2 design called for running `BARTModel.sample()` / `bart()` with `y_dummy = zeros` and `observation_weights = zeros`. This was abandoned after implementation revealed two blocking problems:
+
+1. **C++ NaN with exact zero weights.** Setting `w_i = 0` produces NaN predictions from the C++ sampler. This is because they are treated as unit-specific variance adjustments that accumulate as `1 / w_i` with no special code path for zero weights.
+
+2. **Large-σ² workaround has MCMC autocorrelation.** An alternative — setting `sigma2_init = 1e6` and `sample_sigma2_global = False` so the leaf posterior collapses to its prior — works mathematically but produces correlated samples (the MCMC chain still mixes between tree topologies, so draws are not independent). It also means eschewing sampling from the $\sigma^2$ prior.
+
+**Chosen design — `MCMCPriorSampleOneIter`:**
+
+Add a new C++ function `MCMCPriorSampleOneIter` (in `src/tree_sampler.cpp` / `include/stochtree/tree_sampler.h`) that:
+
+1. Accepts most of the same arguments as `MCMCSampleOneIter` (i.e. `TreeEnsemble`, `ForestTracker`, `ForestContainer`, etc).
+2. For each sample, iterates over all trees and grows each tree by repeatedly sampling grow/prune moves from the branching process prior alone — no data, no sufficient statistics, no likelihood in the MH acceptance ratio.
+3. After each tree has been sampled, draws each leaf parameter independently from `N(0, σ²_μ)`.
+
+This produces **independent** samples (no chain, no autocorrelation), requires no outcome data, and is free of any likelihood computation. The covariate matrix `X` is still needed to evaluate the forest at prediction time but plays no role during sampling.
+
+New pybind11 bindings (`py_stochtree.cpp`) and cpp11 wrappers (`R/sampler.R`) will expose `MCMCPriorSampleOneIter` to the high-level interfaces.
 
 ### New API
 
-#### Python: `bart_prior_sample()`
+#### Python: `sample_bart_prior()`
 
 ```python
-def bart_prior_sample(
+def sample_bart_prior(
     X: np.ndarray,
     num_samples: int = 100,
-    num_burnin: int = 0,
     general_params: dict | None = None,
     mean_forest_params: dict | None = None,
 ) -> BARTModel:
     """
     Sample from the BART prior over functions f: X -> R.
 
+    Produces independent prior draws by sampling tree structures from
+    the branching process prior and leaf parameters from N(0, sigma2_leaf).
+    No outcome data is required or used.
+
     Parameters
     ----------
     X : np.ndarray, shape (n, p)
-        Covariate matrix defining the domain. Samples will reflect the
-        marginal tree prior evaluated at these X values.
+        Covariate matrix defining the domain.
     num_samples : int
-        Number of prior draws to return.
-    num_burnin : int
-        Burn-in iterations (usually 0 since there is no posterior to mix
-        towards, but provided for interface consistency).
+        Number of independent prior draws.
     general_params, mean_forest_params : dict, optional
-        Same as in BARTModel.sample(). Controls num_trees, alpha/beta,
-        leaf scale, etc.
+        Controls num_trees, alpha/beta, leaf scale, etc.
 
     Returns
     -------
     BARTModel
-        A fitted BARTModel whose y_hat_train samples are draws from
-        the BART prior p(f(X)).
+        Object whose y_hat_train contains num_samples prior draws of f(X).
     """
-    n = X.shape[0]
-    y_dummy = np.zeros(n)
-    weights = np.zeros(n)
-    model = BARTModel()
-    model.sample(
-        X_train=X,
-        y_train=y_dummy,
-        observation_weights=weights,
-        num_gfr=0,
-        num_burnin=num_burnin,
-        num_mcmc=num_samples,
-        general_params=general_params,
-        mean_forest_params=mean_forest_params,
-    )
-    return model
+    # initialize data structures
+
+    # call pybind11 wrapper around MCMCPriorSampleOneIter
+
+    # unpack and return predictions and prior parameter samples
 ```
 
-This lives in `stochtree/bart.py` as a module-level function (not a method) and is exported from `stochtree/__init__.py`.
+Module-level function in `stochtree/bart.py`, exported from `stochtree/__init__.py`.
 
-#### R: `bart_sample_prior()`
+#### R: `sampleBARTPrior()`
 
 ```r
 sampleBARTPrior <- function(
   X,
   num_samples = 100,
-  num_burnin = 0,
   general_params = list(),
   mean_forest_params = list()
 ) {
-  n <- nrow(X)
-  y_dummy <- rep(0, n)
-  observation_weights <- rep(0, n)
-  bart(
-    X_train = X,
-    y_train = y_dummy,
-    observation_weights = observation_weights,
-    num_gfr = 0,
-    num_burnin = num_burnin,
-    num_mcmc = num_samples,
-    general_params = general_params,
-    mean_forest_params = mean_forest_params
-  )
+  # initialize data structures
+
+  # call pybind11 wrapper around MCMCPriorSampleOneIter
+
+  # unpack and return predictions and prior parameter samples
 }
 ```
 
-This lives in `R/bart.R` and is exported from `NAMESPACE`.
+Lives in `R/bart.R`, exported from `NAMESPACE`.
 
 ### Handling `num_gfr`
 
-The GFR (grow-from-root) warm-start uses a regression-tree-style initialization that depends on the data. With zero weights, GFR initialization is ill-defined. The convenience wrappers above therefore hard-code `num_gfr = 0`. The low-level `bart()` / `BARTModel.sample()` do not enforce this restriction — advanced users who pass `observation_weights = zeros` manually with `num_gfr > 0` should receive an error.
+Not applicable — the direct prior sampler has no GFR warm-start. The convenience wrappers do not expose a `num_gfr` argument.
 
 ---
 
@@ -181,7 +174,7 @@ The GFR (grow-from-root) warm-start uses a regression-tree-style initialization 
 
 A new multilingual vignette should demonstrate:
 
-1. Sampling `f ~ BART prior` using `bart_sample_prior()`
+1. Sampling `f ~ BART prior` using `sampleBARTPrior()` (R) / `sample_bart_prior()` (Python)
 2. Plotting several prior draws as functions of a 1D covariate to build intuition about how `num_trees`, `alpha`, `beta`, and leaf scale affect the prior
 3. Computing prior predictive distributions: `p(y | X, prior)` by adding $\sigma^2$ draws on top of the `f` draws
 4. A simple calibration example: choosing `num_trees` so that the prior 95% interval for `f(x)` spans a user-specified range
@@ -194,33 +187,30 @@ A new multilingual vignette should demonstrate:
 
 # Risks and Drawbacks
 
-- **Zero-weight sampler behavior needs validation.** While the math is straightforward, we should verify empirically (via a unit test) that the sampler with `w_i = 0` actually produces draws consistent with the analytical prior — e.g., that the marginal variance of `f(x)` matches `num_trees * leaf_scale²` for a flat leaf prior.
-- **$\sigma^2$ sampling with zero weights.** The IG posterior for `σ²` when all weights are zero reduces to the prior. The existing sampler should handle this gracefully (no data contribution to the shape/rate), but this edge case should be tested explicitly.
+- **New C++ code path.** `MCMCPriorSampleOneIter` is a new function that bypasses the MCMC machinery entirely. It needs careful unit testing to confirm that the marginal variance of `f(x)` matches `num_trees × leaf_scale²` for a flat leaf prior and that tree depth distributions match the branching process prior analytically.
 - **`observation_weights` name vs. `variance_weights` in C++.** The C++ layer calls these `var_weights` (short for "variance weights") because they scale the residual variance as `σ²/w_i`. The high-level name `observation_weights` is more familiar to applied users. This naming gap should be documented in the API docstrings to avoid confusion.
-- **BCF complication.** The BCF model has an internal propensity model (`bart()` fit on `Z ~ X`) that is also affected by the observation weights and many more potential terms (adaptive coding, parametric CATE intercept), and designing its prior sampler will require additional complexity, which is deferred to after completion of this work.
+- **BCF prior sampling deferred.** The BCF model has additional complexity (adaptive coding, parametric CATE intercept, propensity model) that makes designing a BCF prior sampler non-trivial. This is deferred until the BART prior sampler is complete and validated.
 
 # Alternatives
 
-## Alternative 1: Direct prior sampler (no MCMC)
+## Alternative 1: Zero-weight MCMC (originally planned for Phase 2)
 
-Rather than running MCMC with zero weights, implement a standalone function that samples tree structures directly from the branching process prior and then draws leaf parameters from `N(0, σ²_μ)`. This is more computationally efficient (no chain mixing concerns) and conceptually cleaner.
+Run the MCMC sampler on a dummy dataset with `y_train = zeros` and `observation_weights = zeros`. With all weights zero, the weighted sufficient statistics vanish and the sampler should draw from the prior.
 
-**Why not chosen (now):** This requires a new code path in the C++ tree sampler that bypasses all data-dependent logic. The effort is substantially larger than Phase 1+2 above, and the zero-weight MCMC approach produces correct samples for the same cost. The direct sampler could be a future enhancement once the zero-weight approach is validated and user demand is confirmed.
+**Why not chosen:** Implemented and then abandoned. Exact zero weights produce NaN predictions from the C++ sampler (likely a `σ²/w_i` evaluation in the residual computation). A large-σ² workaround (`sigma2_init = 1e6, sample_sigma2_global = False`) makes the leaf posterior collapse to its prior and gives numerically correct results, but the chain still mixes between tree topologies so draws are correlated, not independent. The direct C++ prior sampler (chosen design) solves both problems cleanly.
 
 ## Alternative 2: Expose only case weights, document the trick manually
 
-Add `observation_weights` to the high-level interface (Phase 1) but skip the convenience wrapper (Phase 2), leaving it to users and documentation to combine zero-outcome + zero-weight inputs.
+Add `observation_weights` to the high-level interface (Phase 1) but skip the convenience wrapper (Phase 2), leaving it to users and documentation to combine the approach manually.
 
-**Why not chosen:** The convenience wrapper is small (< 20 lines in each language) and substantially lowers the barrier for the prior-sampling use case. The vignette can serve as the primary documentation regardless.
+**Why not chosen:** The convenience wrapper is small and substantially lowers the barrier for the prior-sampling use case. Moot now that the zero-weight approach is off the table — the direct sampler has to be implemented regardless.
 
-## Alternative 3: Sample a single long chain and thin
+## Alternative 3: Epsilon-weight hack
 
-Use a tiny positive weight (e.g., `w_i = 1e-10`) instead of exact zero to avoid any potential division-by-zero issues in the sampler.
+Use a tiny positive weight (e.g., `w_i = 1e-10`) instead of exact zero to avoid division-by-zero.
 
-**Why not chosen:** Exact zero is mathematically cleaner and the C++ code path for zero weights should be safe (sufficient statistics are zero, not `NaN`). This should be verified in testing, but epsilon-weight hacks introduce hyperparameter sensitivity and conceptual murkiness. If numerical issues arise in testing, this can serve as a fallback.
+**Why not chosen:** Implemented and tested experimentally. With `w = 1e-10`, predictions are near-zero (the data contribution is effectively silenced) but the sampler appears stuck and the variance behavior is unpredictable. With `w = 0.1`, the chain mixes but is clearly data-influenced. No epsilon value makes the sampler cleanly sample from the prior without either NaN, stuck chains, or data contamination.
 
 # Open Questions
 
-1. **Should `bart_prior_sample()` / `bart_sample_prior()` also return $\sigma^2$ samples?** The current `BARTModel` does return `global_var_samples` when `sample_sigma2_global = True`. For prior sampling this is the correct behavior ($\sigma^2$ is drawn from its IG prior). The convenience wrapper should probably enable `sample_sigma2_global` by default so users can easily construct the full prior predictive distribution `y ~ N(f(x), σ²)`.
-
-2. **Interactions with complex models**: work out the details of whether observations weights can be used with variance forests and probit / cloglog outcome models and add appropriate warnings / error handling and testing.
+1. **Interactions with observation weights and complex models**: resolved for Phase 1 — variance forests produce a warning (untested), cloglog link produces an error (not compatible), probit is allowed (latent Gaussian, weights well-defined at the latent level).
