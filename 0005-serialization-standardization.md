@@ -1,7 +1,5 @@
 # Standardizing Serialization/Deserialization Formats for Models
 
-PR link: [#5](https://github.com/StochasticTree/rfcs/pull/5)
-
 Tracking issue: TBD
 
 # Overview
