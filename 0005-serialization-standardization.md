@@ -15,10 +15,9 @@ Right now, `stochtree` makes it possible to continue sampling an existing model 
 
 [RFC 4](https://github.com/StochasticTree/rfcs/blob/main/0004-cpp-dispatch.md) means the R and Python routines have a much larger shared C++ core and there is a documented API for passing structured inputs / outputs to / from C++. This allows us to simplify use case 1 above, so that a `BARTModel` or `BCFModel` object retains an in-memory pointer to a C++ `BARTSamples` / `BCFSamples` object, which can be appended to by continuing a sampler (with different hyperparameters). Similarly, with more of the sampling logic in C++, we can standardize model / parameter deserialization so that the C++ samplers ingest a(n optional) JSON string and initialize model state from the provided model.
 
-Finally, this RFC will unlock two currently unsupported use cases:
+Finally, this RFC will unlock a currently unsupported use case:
 
-1. Allow models built in R to be deserialized into Python and vice versa, and
-2. Predict directly from a serialized model
+* Allow models built in R to be deserialized into Python and vice versa (for models fit on purely numeric covariates; categorical data must be reduced to a numeric matrix before fitting to be cross-platform portable), and
 
 # Proposed Implementation
 
@@ -37,7 +36,7 @@ The BART JSON object follows the schema below
 | --- | --- |
 | `"stochtree_version"` | Version number that model was sampled under |
 | `"outcome_scale"` | Scale factor used for standardizing continuous outcomes (1 if no standardization) |
-| `"outcome_mean"` | Mean shift factor used for standardizing continuous outcomes (1 if no standardization) |
+| `"outcome_mean"` | Mean shift factor used for standardizing continuous outcomes (0 if no standardization) |
 | `"standardize"` | Whether a continuous outcome was standardized during sampling |
 | `"sigma2_init"` | Initial value of global error scale used in the model |
 | `"sample_sigma2_global"` | Whether global error scale was sampled or not |
@@ -161,7 +160,7 @@ For convenience, we'll say the original covariate set (data frame or numpy array
 
 #### Forests
 
-Forests are stored under the `"forests"` key. Forests are serialized to JSON all in C++ and the JSON is added to the model's JSON object under the `forests_{i}` key, where by convention `forest_0` is the mean forest, if one exists. If a variance forest exists, it is indexed at `forest_1` if a mean forest also exists, otherwise `forest_0`.
+Forests are stored under the `"forests"` key. Each forest is serialized to JSON in C++ and added under a self-describing named key rather than a positional index. For BART the keys are `"mean_forest"` and `"variance_forest"`; a model includes whichever of these it sampled. Named keys replace the previous positional `forest_0` / `forest_1` convention, whose meaning depended on which forests were present (e.g. the variance forest was `forest_1` if a mean forest existed and `forest_0` otherwise). With named keys a reader can load a forest directly, without first inspecting `include_mean_forest` / `include_variance_forest`.
 
 #### Random Effects
 
@@ -177,10 +176,11 @@ We standardize on a new unified schema for both R and Python BART
 
 | New Field | Previous R Field | Previous Python Field | Notes | Action |
 | --- | --- | --- | --- | --- |
+| `"schema_version"` |  |  | Integer identifying the serialized format (see [Explicit handling of older JSON formats](#explicit-handling-of-older-json-formats)); `1` for this RFC's schema | Add to R and Python |
 | `"stochtree_version"` | `"stochtree_version"` | `"stochtree_version"` | Version number that model was sampled under |  |
 | `"platform"` |  |  | Whether model was sampled in R or Python | Add to R and Python |
 | `"outcome_scale"` | `"outcome_scale"` | `"outcome_scale"` | Scale factor for standardizing continuous outcomes (1 if none) |  |
-| `"outcome_mean"` | `"outcome_mean"` | `"outcome_mean"` | Mean shift factor for standardizing continuous outcomes (1 if none) |  |
+| `"outcome_mean"` | `"outcome_mean"` | `"outcome_mean"` | Mean shift factor for standardizing continuous outcomes (0 if none) |  |
 | `"standardize"` | `"standardize"` | `"standardize"` | Whether a continuous outcome was standardized during sampling |  |
 | `"sigma2_init"` | `"sigma2_init"` | `"sigma2_init"` | Initial value of global error scale |  |
 | `"sample_sigma2_global"` | `"sample_sigma2_global"` | `"sample_sigma2_global"` | Whether global error scale was sampled |  |
@@ -220,57 +220,37 @@ Note that the top-level `"rfx_unique_group_ids"` field is being removed from the
 
 ##### Covariate Preprocessor
 
-Both covariate preprocessor schemas contain similar information: (1) which features need to be treated as ordered categorical (with categories possibly remapped to integers) or unordered categorical (one-hot encoded) and (2) which categories are observed in a feature.
+Both covariate preprocessor schemas contain similar information: which features are ordered categorical (codes remapped to integers) or unordered categorical (one-hot encoded), and which categories are observed in each feature. They differ in structure, reflecting the design of the underlying R and Python objects.
 
-Differences in structure largely reflect the design of the associated R and Python objects. We propose a "superset" schema that includes enough information to load either the R or Python preprocessor
+For 0.5.0 we deliberately **do not unify** these two native schemas. Each platform's native preprocessor keeps its existing schema (documented above) and is **same-platform only**: an R-written native preprocessor is read back by R, a Python-written one by Python. The only changes here are the high-level field rename (`preprocessor_metadata` -> `covariate_preprocessor`, see the [Reconciliation](#reconciliation) table) and one added field inside the `covariate_preprocessor` object, `cross_platform_portable`, described below.
 
-| New Field | Previous R Field | Previous Python Field | Notes | Action |
-| --- | --- | --- | --- | --- |
-| `"num_original_features"` | | `"num_original_features"` | | Add to R |
-| `"num_numeric_features"` | `"num_numeric_vars"` | | | Add to Python |
-| `"num_ordinal_features"` | `"num_ordered_cat_vars"` | `"num_ordinal_features"` |  | |
-| `"num_onehot_features"` | `"num_unordered_cat_vars"` | `"num_onehot_features"` |  | |
-| `"ordinal_feature_index"` |  | `"ordinal_feature_index"` | R's `"ordered_cat_vars"` can be constructed from this array as well as the original feature names | Add to R | 
-| `"onehot_feature_index"` |  | `"onehot_feature_index"` | R's `"unordered_cat_vars"` can be constructed from this array as well as the original feature names | Add to R | 
-| `"processed_feature_types"` |  | `"processed_feature_types"` | | Add to R | 
-| `"original_feature_types"` | `"feature_types"` | `"original_feature_types"` | | Harmonize schema between R and Python |
-| `"original_feature_indices"` | `"original_var_indices"` | `"original_feature_indices"` | | |
-| `"ordinal_dtype_list"` |  | `"ordinal_dtype_list"` | All categories stored as strings in R | Add to R, all string |
-| `"ordinal_categories_list"` |  | `"ordinal_categories_list"` | R's `"ordered_unique_levels"` can be constructed from this list | Add to R |
-| `"onehot_dtype_list"` | | `"onehot_dtype_list"` | All categories stored as strings in R | Add to R, all string |
-| `"onehot_categories_list"` |  | `"onehot_categories_list"` | R's `"unordered_unique_levels"` can be constructed from this list | Add to R |
-| `"original_feature_names"` | | | Not technically stored in either JSON at the moment, but needed for reconstructing R's preprocessor from the elements above | Add to Python and R |
+**Cross-platform portability**
 
-R's `"numeric_vars"` list will be reconstructed as the set difference of the covariate's names and the reconstructed `"ordered_cat_vars"` and `"unordered_cat_vars"` lists
+Superficially, the R `data.frame` and pandas `DataFrame` are both containers for storing columns of data with (potentially) disparate types. Dataframes with entirely numeric columns can be treated more or less equivalently between R and Python. However, categorical, string, and other more complex column types have many implementation differences between R and Python that make it difficult to process data equivalently.
 
-**Original feature types schema**
+Each platform's internal covariate preprocessor stores the information needed to convert an R data frame to an R matrix or a pandas data frame to a numpy array. Rewriting this schema to ensure fully replicable cross-platform processing is beyond the scope of this proposal. Instead, we articulate three common cases and establish clear expectations for how `stochtree` handles each case:
 
-Python's `"original_feature_types"` encodes features in one of six labels: `"category"`, `"string"`, `"boolean"`, `"integer"`, `"float"`, and `"unsupported"`. Both `"category"` and `"string"` can be either ordered or unordered categorical (this information is encoded by `"ordinal_feature_index"` and `"onehot_feature_index"`). `"boolean"`, `"integer"`, and `"float"` are all converted to numeric features.
+* **Portable: all-numeric training data.** If every covariate is numeric (`numeric` / `integer` / `logical` in R; `float` / `int` / `bool` in pandas; or a bare matrix / `ndarray`), the covariate transform for each column is the identity and the model carries no platform-specific preprocessing complications. Such a model **must** load and predict in either language. 
+    * *Note*: this also provides a separate path to cross-platform replicability: users who want a portable model may pre-convert their data to a numeric model matrix / array themselves before sampling. After that, they can run the same model from a different platform as long as the data is arranged and oriented in the same state as the training data.
+* **Same-platform only: non-numeric training data.** Any model with non-numeric covariates (categorical, string, etc) that were encoded through an R / Python preprocessor can only be deserialized on the same-platform. Same-platform deserialization is unaffected. Any attempt at a *cross-platform* load is **refused with a clear error** naming the offending column(s), as opposed to being silently mis-transformed.
 
-R's `"feature_types"` encodes features as 0 for numeric, 1 for ordered categorical and 2 for unordered categorical.
+The contract concerns reproduction of the *covariate transformation* (raw covariates -> numeric model matrix), not reconstruction of a native `data.frame` / `DataFrame`. Because the model only ever consumes the transformed numeric matrix, the all-numeric guarantee is sufficient for both prediction and continued sampling.
 
-Our schema uses the Python approach, where the data type of an R column determines which of the labels a feature gets. In R, the mapping will be:
+**The `cross_platform_portable` flag.** The determination is machine-checkable via a single boolean stored in the `covariate_preprocessor` object, computed at serialization time:
 
-* `"numeric"` -> `"float"`
-* `"integer"` -> `"integer"`
-* `"logical"` -> `"boolean"`
-* `"character"` -> `"string"`
-* `"factor"` -> `"category"`
+```
+cross_platform_portable = (all covariates numeric)
+```
 
-**Original feature name schema**
+When false it is accompanied by the list of offending columns. The cross-platform loader checks it: when the writer's `"platform"` differs from the loading platform and the flag is false, the load errors; same-platform loads ignore the flag entirely. For legacy (v0) models the flag is computed during the v0 -> v1 migration from the model's feature types (true only for all-numeric models).
 
-R matrices and numpy arrays do not have "column names," so we handle the "null case" consistently on both platforms: columns are labeled as `"x1"`, `"x2"`, ..., `"xp"`.
+The user-facing mental model: **a cross-platform load works exactly when the model was fit on purely numeric covariates.** An unsupported cross-platform load is detected and refused, never silently mis-transformed, so a successful cross-platform load can be trusted as a correct one.
 
-**Processed feature type list in R**
-
-We add the `"processed_feature_types"` to R by the following procedure:
-
-* If a column is numeric (i.e. passed through without transformation), the index of its corresponding column in the transformed data matrix is marked with a 0
-* If a column is ordinal / categorical (i.e. transformed to integer or one-hot encoded), the indices of its corresponding columns in the transformed data matrix are marked with a 1
+> *Future work (out of scope for 0.5.0).* A standardized, language-neutral preprocessor that reduces categorical data to a numeric matrix portably -- letting categorical models also qualify as cross-platform -- is a natural extension and is deliberately deferred. Nothing in this schema forecloses it: such a preprocessor would simply be another way to produce an all-numeric (portable) model, requiring no envelope changes. For 0.5.0 we document only the recommended practice (reduce categoricals to a numeric matrix before fitting); a thin convenience helper may ship, but it carries no portable-serialization guarantee.
 
 ##### Forests
 
-[*Unchanged*]
+The forest keys are renamed to the self-describing names defined in the schema section above (`mean_forest` / `variance_forest`). This rename applies identically to R and Python, so there are no R-vs-Python reconciliation differences to resolve.
 
 ##### Random Effects
 
@@ -284,7 +264,7 @@ The BCF JSON object follows the schema below
 | --- | --- |
 | `"stochtree_version"` | Version number that model was sampled under |
 | `"outcome_scale"` | Scale factor used for standardizing continuous outcomes (1 if no standardization) |
-| `"outcome_mean"` | Mean shift factor used for standardizing continuous outcomes (1 if no standardization) |
+| `"outcome_mean"` | Mean shift factor used for standardizing continuous outcomes (0 if no standardization) |
 | `"standardize"` | Whether a continuous outcome was standardized during sampling |
 | `"sigma2_init"` | Initial value of global error scale used in the model |
 | `"sample_sigma2_global"` | Whether global error scale was sampled or not |
@@ -332,7 +312,7 @@ The BCF JSON object follows the schema below
 
 #### Forests
 
-Forests are stored under the `"forests"` key. Forests are serialized to JSON all in C++ and the JSON is added to the model's JSON object under the `forests_{i}` key, where by convention `forest_0` is the prognostic forest and `"forest_1"` is the treatment effect forest. If a variance forest exists, it is indexed at `forest_2`.
+Forests are stored under the `"forests"` key. Each forest is serialized to JSON in C++ and added under a self-describing named key rather than a positional index: `"prognostic_forest"`, `"treatment_forest"`, and (if sampled) `"variance_forest"`. As with BART, named keys let a reader load each forest without inspecting which forests are present, replacing the previous positional `forest_0` / `forest_1` / `forest_2` convention.
 
 #### Random Effects
 
@@ -348,10 +328,11 @@ We standardize on a new unified schema for both R and Python BCF
 
 | New Field | Previous R Field | Previous Python Field | Notes | Action |
 | --- | --- | --- | --- | --- |
+| `"schema_version"` |  |  | Integer identifying the serialized format (see [Explicit handling of older JSON formats](#explicit-handling-of-older-json-formats)); `1` for this RFC's schema | Add to R and Python |
 | `"stochtree_version"` | `"stochtree_version"` | `"stochtree_version"` | Version number that model was sampled under |  |
 | `"platform"` |  |  | Whether model was sampled in R or Python | Add to R and Python |
 | `"outcome_scale"` | `"outcome_scale"` | `"outcome_scale"` | Scale factor for standardizing continuous outcomes (1 if none) |  |
-| `"outcome_mean"` | `"outcome_mean"` | `"outcome_mean"` | Mean shift factor for standardizing continuous outcomes (1 if none) |  |
+| `"outcome_mean"` | `"outcome_mean"` | `"outcome_mean"` | Mean shift factor for standardizing continuous outcomes (0 if none) |  |
 | `"standardize"` | `"standardize"` | `"standardize"` | Whether a continuous outcome was standardized during sampling |  |
 | `"sigma2_init"` | `"sigma2_init"` | `"sigma2_init"` | Initial value of global error scale |  |
 | `"sample_sigma2_global"` | `"sample_sigma2_global"` | `"sample_sigma2_global"` | Whether global error scale was sampled |  |
@@ -398,7 +379,7 @@ This is handled exactly as in the [BART JSON Schema](#bart-json-schema) section
 
 ##### Forests
 
-[*Unchanged*]
+The forest keys are renamed to the self-describing names defined in the schema section above (`prognostic_forest` / `treatment_forest` / `variance_forest`). This rename applies identically to R and Python, so there are no R-vs-Python reconciliation differences to resolve.
 
 ##### Random Effects
 
@@ -406,7 +387,61 @@ This is handled exactly as in the [BART JSON Schema](#bart-json-schema) section
 
 ## Explicit handling of older JSON formats
 
-Current serialization / deserialization routines are designed to (attempt to) gracefully handle JSON objects from earlier stochtree versions **within** a single platform. On the R side, version inference proceeds largely by checking for the presence of fields:
+### Schema versioning
+
+We introduce a single top-level integer field, `"schema_version"`, that identifies the *structure and meaning* of the serialized envelope. It is deliberately decoupled from the package version:
+
+| Field | Role | Gates behavior? |
+| --- | --- | --- |
+| `"schema_version"` | Identifies the structure / contract of the serialized format | Yes |
+| `"stochtree_version"` | Package version the model was sampled under | No (informational breadcrumb only) |
+| `"platform"` | Which native preprocessor object (R vs Python) to reconstruct | No (reconstruction only, not parsing) |
+
+`schema_version` is a monotonic integer rather than a semantic version -- the only operations we ever perform on it are `==`, `<`, and `>`, so an integer avoids any "is 1.2 compatible with 1.1" ambiguity. The unified schema introduced by this RFC is `schema_version = 1`; a missing field denotes a legacy (pre-0.5.0) model, treated as version 0.
+
+Keeping these three fields separate is the core idea: `schema_version` says *what fields exist and what they mean*, `platform` says *which native object to rebuild*, and `stochtree_version` is a human-readable breadcrumb that -- consistent with the current behavior documented in `utils.py` -- never gates deserialization. This is what lets a model serialized under a dev build (where the stamped `stochtree_version` may be `"dev"` or `0.5.0.9000`) parse identically to one serialized under the released `0.5.0`.
+
+**Bump policy.** `schema_version` increments *only* on a breaking change:
+
+* Additive, optional field with a safe default -> **do not bump** (readers tolerate unknown fields and supply defaults for missing ones)
+* Rename / remove / re-type a field, change a field's semantics, or change a structural convention (e.g. the positional -> named forest keys) -> **bump**
+
+This keeps the integer meaningful and bumps rare.
+
+**Reader rules.** A reader compares the loaded `schema_version` (call it `v`) against the maximum version it supports (`current`):
+
+| Loaded `v` | Action |
+| --- | --- |
+| `v == current` | Parse directly |
+| `v < current` | Run the migration ladder up to `current`, then parse |
+| `v > current` | **Hard error**: the model was written by a newer stochtree; instruct the user to upgrade |
+| absent | Legacy model; treat as version 0 and run the field-presence heuristic below |
+
+We fail loudly on `v > current` rather than attempting a best-effort parse: silently mis-loading a statistical model is a correctness hazard.
+
+### Migration ladder
+
+Rather than a parser that branches on version throughout (the pattern the field-presence heuristic below already embodies), we up-convert on read through a chain of pure functions `migrate_v0_to_v1`, `migrate_v1_to_v2`, ..., applied in sequence until the JSON reaches `current`. A single parser then ingests only current-schema JSON:
+
+```
+json_in -> [detect schema_version] -> migrate (0 -> 1 -> 2 -> ...) -> parse(current) -> BARTSamples / BCFSamples
+```
+
+All legacy knowledge lives in small, append-only, individually testable migration steps (each with a `vN fixture -> vN+1 fixture` unit test); the live parser stays clean and only ever sees the current schema. Bumping the schema is then "append one migration plus one golden fixture," never a rewrite of the parser. Because this RFC moves serialization into C++, migrations live in C++ so that R and Python share them.
+
+**v0 -> v1 is the platform-aware migration.** Pre-0.5.0 R and Python diverge (`preprocessor_metadata` vs `covariate_preprocessor`, the R-only `rfx_unique_group_ids`), so the v0 -> v1 step branches on platform and *is* the [Reconciliation](#reconciliation) work described above: the high-level field renames and removals, plus computing `cross_platform_portable` from the model's feature types. It does **not** unify the two native preprocessor layouts -- those stay per-platform and same-platform-only -- so the migration leaves the `covariate_preprocessor` sub-object essentially in place (renamed, not restructured). Note the circularity: `platform` is a field this RFC *introduces* in v1, so a legacy model does not carry it -- the v0 -> v1 migration is the *producer* of `platform`, not a consumer. It therefore infers the source platform from structural fingerprints in the legacy JSON (`preprocessor_metadata` present and `covariate_preprocessor` absent => R; `covariate_preprocessor` present => Python; the R-only `rfx_unique_group_ids` corroborates R), with a documented fallback discriminator for models that carry no preprocessor metadata at all. Every migration from v1 onward operates on the single unified format and is platform-agnostic.
+
+**Forest container versioning.** `schema_version` covers the model *envelope* (metadata, parameters, preprocessor, and how forests are keyed). The lower-level C++ `ForestContainer` JSON -- the component most likely to change for performance reasons -- should carry its own independent version internally, so that a forest-layout change does not force re-migration of unrelated envelope components.
+
+**Nested propensity model.** The BCF `bart_propensity_model` is a nested BART envelope written by the same unified writer, so it carries the same `schema_version`; migrations recurse into it.
+
+### Legacy version detection (the v0 sub-classifier)
+
+When `schema_version` is absent, the model predates this RFC and we fall back to the existing field-presence heuristic to determine which legacy migration entry point to use. This is the current inference logic, demoted from a primary mechanism to the bottom rung of the migration ladder.
+
+Note that this heuristic returns a heterogeneous result: a concrete version string (e.g. `"0.4.3"`) when version stamping existed, a bracket (e.g. `"<0.4.1"`) for the pre-stamping era, or `"unknown"`. Because the bulk of serialized models in the wild come from the stamped-but-pre-`schema_version` era (~0.3.0 through 0.4.x), the v0 importer normalizes all of these onto a single internal `legacy_format_id` enum before dispatching, rather than routing on a value that is sometimes a version and sometimes a range. This step also defines an explicit supported floor (models older than the floor, and any `"unknown"` result, are rejected with a clear message rather than parsed best-effort -- the same correctness-hazard argument applied to `v > current` above).
+
+On the R side, the heuristic proceeds largely by checking for the presence of fields:
 
 ```r
 inferStochtreeJsonVersion <- function(json_object) {
@@ -483,6 +518,12 @@ def _infer_stochtree_version(json_string: str) -> str:
     return "unknown"
 ```
 
+### Testing schema migrations
+
+Forward- and backward-compatibility are guarded by checked-in golden fixtures: one serialized model per `schema_version` (and per legacy bracket), with a test that loads each and asserts the resulting in-memory state. Older fixtures must continue to load indefinitely. Cross-platform fixtures pair an R-written and a Python-written **all-numeric** model at the same `schema_version` and assert that both load in *both* languages to identical state; a separate fixture pairs a native-categorical model with the assertion that a cross-platform load is *refused* with a clear error (cross-platform loading is only guaranteed for all-numeric models). Adding a new schema version means adding a migration plus a new golden fixture; existing fixtures are never modified.
+
+The coverage is not uniform across rungs. Each `vN -> vN+1` step for `N >= 1` operates on the single unified format and needs only its one `vN fixture -> vN+1 fixture` pair. The `v0 -> v1` rung is the exception and needs the heaviest coverage: its input space is the messy pre-0.5.0 era (multiple legacy brackets, optional/absent fields, R-vs-Python divergence, and the platform inference it produces rather than consumes), so it warrants roughly one golden fixture *per legacy bracket* and per platform, exercising the field-presence sub-classifier and the platform-fingerprint fallback. Treat `v0 -> v1` as the rung most likely to harbor edge cases and fixture it accordingly.
+
 ## Persisting pointers to C++ model samples objects in BART and BCF model classes
 
 Right now, the C++ API for BART and BCF models creates several objects in-memory, namely:
@@ -494,27 +535,34 @@ The sampler object is destroyed when it goes out of scope (i.e. after the call t
 
 This RFC proposes that the BART and BCF objects in R and Python maintain persistent pointers to `BARTSamples` / `BCFSamples` C++ objects, unpacking them only when they are queried by the `extract_parameter` method.
 
+Both the samples object and the `BARTSampler` / `BCFSampler` (which holds the sampler's RNG state and references to the training data) are owned by the R / Python model object and live exactly as long as it does. Tying their lifetime to model-object scope has two consequences: (1) `continue_sampling` resumes the same RNG stream, so a continued run is statistically equivalent to having drawn the additional samples in the original call; and (2) the training data and sampler state remain resident in C++ memory for the model object's lifetime -- a deliberate space-for-functionality tradeoff. For multi-chain models, this implies one persistent sampler state per chain.
+
 ### Migration plan
 
 Redesigning the BART and BCF objects to store results in a C++ samples object, rather than internal fields like `global_var_samples` would break any code that directly references these internal fields (as opposed to code that queries them via `extract_parameter`), so we need a plan for graceful deprecation.
 
-We propose to do this via a warning that runs when users try to directly access deprecated fields from a `BARTModel` or `BCFModel` object. In Python, we'd do this with a custom `__getattr__`
+For the initial release (0.5.0) we keep these accesses working rather than breaking them outright: when a user reads a moved field, we **auto-load the requested term** from the C++ samples object (equivalent to the corresponding `extract_parameter` call) and emit a `DeprecationWarning`. The shim is removed in a later release, after which the access raises (Python) / returns `NULL` (R). In Python, we do this with a custom `__getattr__`
 
 ```python
+# Maps each moved attribute to the extract_parameter key that now backs it.
 _MOVED_ATTRS = {
-  "global_var_samples": "Access via `model.extract_parameter('sigma2_global')`.",
-  "leaf_scale_samples": "Access via `model.extract_parameter('sigma2_leaf')`.",
+  "global_var_samples": "sigma2_global",
+  "leaf_scale_samples": "sigma2_leaf",
 }
 
 class BARTModel:
     def __getattr__(self, name):
         if name in _MOVED_ATTRS:
+            param = _MOVED_ATTRS[name]
             warnings.warn(
-                f"'{name}' is no longer a direct attribute of BARTModel as of version 0.5.0. "
-                f"{_MOVED_ATTRS[name]}",
+                f"'{name}' is no longer a direct attribute of BARTModel as of version 0.5.0; "
+                f"access it via model.extract_parameter('{param}'). This compatibility shim "
+                f"will be removed in a future release.",
                 DeprecationWarning,
                 stacklevel=2,
             )
+            # __getattr__ only fires on failed lookups, so this does not recurse.
+            return self.extract_parameter(param)
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 ```
 
@@ -522,13 +570,15 @@ In R with an S3 object, we'd do this by overloading the `$` access operator
 
 ```r
 `$.bartmodel` <- function(x, name) {
+  # Maps each moved field to the extract_parameter key that now backs it.
   moved <- list(
-    sigma2_global_samples = "Use extract_parameter(model, 'sigma2_global').",
-    sigma2_leaf_samples = "Use extract_parameter(model, 'sigma2_leaf')."
+    sigma2_global_samples = "sigma2_global",
+    sigma2_leaf_samples = "sigma2_leaf"
   )
   if (name %in% names(moved)) {
-    warning(sprintf("'%s' is no longer a direct field of the bartmodel object as of version 0.5.0. %s", name, moved[[name]]), call. = FALSE)
-    return(NULL)
+    warning(sprintf("'%s' is no longer a direct field of the bartmodel object as of version 0.5.0; use extract_parameter(model, '%s'). This compatibility shim will be removed in a future release.", name, moved[[name]]), call. = FALSE)
+    # Auto-load the requested term for one deprecation cycle.
+    return(extract_parameter(x, moved[[name]]))
   }
   .subset2(x, name)
 }
@@ -538,7 +588,7 @@ In R with an S3 object, we'd do this by overloading the `$` access operator
 
 The proposed redesign keeps both `BARTSampler` / `BCFSampler` and `BARTSamples` / `BCFSamples` C++ classes alive, so that continued sampling is as straightforward as dispatching the C++ sampler for more iterations. The simplest way to make this happen is a new `continue_sampling` method in both R and Python that appends to the `BARTSamples` / `BCFSamples` objects.
 
-This method should allow users to pass through updated model hyperparameters in the same format as the original BART / BCF sampler dispatch.
+This method should allow users to pass through updated model hyperparameters in the same format as the original BART / BCF sampler dispatch. These configs are supplied by the user at continuation time and may differ from the original run (e.g. different tree split priors). Structural parameters that are fixed by the existing model -- notably `num_trees`, which is determined by the serialized forest -- are recovered from the model rather than re-specified; the runtime warns and ignores attempts to change them. One consequence for models reconstructed from JSON: any hyperparameter the user does not re-specify falls back to the package default rather than the value used in the original fit (those values are not part of the serialized schema), so faithful continuation of a deserialized model requires re-passing the relevant hyperparameters.
 
 #### BART API
 
@@ -682,12 +732,11 @@ With a single C++ function that writes to a JSON reference based on a `BARTSampl
 
 ```cpp
 static inline void writeJSON(nlohmann::json& json, BARTSamples& samples) {
-  int forest_num = 0;
   if (samples.mean_forests != nullptr) {
-    std::string forest_label = "forest_" + std::to_string(forest_num);
-    nlohmann::json forest_json = samples.mean_forests->to_json();
-    json.at("forests").emplace(forest_label, forest_json);
-    forest_num++;
+    json.at("forests").emplace("mean_forest", samples.mean_forests->to_json());
+  }
+  if (samples.variance_forests != nullptr) {
+    json.at("forests").emplace("variance_forest", samples.variance_forests->to_json());
   }
   // ...
 }
@@ -723,21 +772,14 @@ With a single C++ function that writes to `BARTSamples` / `BCFSamples` object ba
 
 ```cpp
 static inline void readJSON(nlohmann::json& json, BARTSamples& samples) {
-  bool include_mean_forest = json.at("include_mean_forest");
-  bool include_variance_forest = json.at("include_variance_forest");
-  if (include_mean_forest) {
-    nlohmann::json forest_json = json.at("forests").at("forest_0");
+  // Named keys remove the need to branch on which forests are present
+  if (json.at("include_mean_forest")) {
     samples.mean_forests->Reset();
-    samples.mean_forests->from_json(forest_json);
-    if (include_variance_forest) {
-      nlohmann::json forest_json = json.at("forests").at("forest_1");
-      samples.variance_forests->Reset();
-      samples.variance_forests->from_json(forest_json);
-    }
-  } else {
-    nlohmann::json forest_json = json.at("forests").at("forest_0");
+    samples.mean_forests->from_json(json.at("forests").at("mean_forest"));
+  }
+  if (json.at("include_variance_forest")) {
     samples.variance_forests->Reset();
-    samples.variance_forests->from_json(forest_json);
+    samples.variance_forests->from_json(json.at("forests").at("variance_forest"));
   }
   // ...
 }
@@ -746,6 +788,8 @@ static inline void readJSON(nlohmann::json& json, BARTSamples& samples) {
 Both the R and Python interfaces will create this JSON object and then call a wrapper around this C++ serialization function
 
 ## Predicting from serialized models
+
+**Status: considered but explicitly deprioritized for the initial 0.5.0 delivery** (see [Open Questions](#open-questions)). This is a performance convenience with no blocking design need, so the design below is recorded for completeness and may be implemented in a later release.
 
 Right now, serialized models must be reloaded in R or Python before predicting on new data. This RFC will add an interface for obtaining predictions directly from JSON, avoiding some of the costly object reconstruction (though of course not the JSON parsing cost).
 
@@ -835,12 +879,14 @@ def predict_json(
 This RFC adds value in two (related) ways:
 
 1. It avoids the costly roundtrip to JSON and back to continue sampling in-memory models
-2. It unlocks cross-platform serialization -- models built in R can be loaded in Python for inference or continued sampling
+2. It unlocks cross-platform serialization for models fit on purely numeric covariates -- so a numeric model built in R can be loaded in Python for inference or continued sampling -- with non-portable (native-categorical) models detected and refused on cross-platform load rather than silently mis-transformed
 
 # Risks and Drawbacks
 
 This is a large lift which bundles several concerns: JSON parsing, version-tagging, external pointer persistence. 
 The main risk of this RFC is timeline -- it requires some non-trivial C++ design and extensive testing. 
+
+Scoping cross-platform portability to all-numeric models deliberately removes the riskiest sub-problem -- proving that two independently maintained native preprocessors encode categoricals identically -- at the cost of requiring users who want a portable categorical model to reduce it to a numeric matrix themselves before fitting. We mitigate the resulting UX cliff by making the cross-platform refusal loud and actionable (naming the offending columns) rather than silent.
 
 # Alternatives
 
@@ -853,4 +899,4 @@ Several "middle" ground approaches include:
 
 # Open Questions
 
-1. Predicting directly from JSON, unlike many of the other aspects of this RFC, does not have an obvious design need and is primarily a performance convenience. Should it be deferred and implemented separately?
+1. Predicting directly from JSON, unlike many of the other aspects of this RFC, does not have an obvious design need and is primarily a performance convenience. **Resolved: considered but explicitly deprioritized** -- deferred out of the initial 0.5.0 delivery and may be implemented separately in a later release. The design sketch is retained in [Predicting from serialized models](#predicting-from-serialized-models) for reference.
