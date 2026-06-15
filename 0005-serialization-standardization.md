@@ -1,6 +1,6 @@
 # Standardizing Serialization/Deserialization Formats for Models
 
-Tracking issue: TBD
+Tracking issue: [#401](https://github.com/StochasticTree/stochtree/issues/401)
 
 # Overview
 
