@@ -13,7 +13,7 @@ Right now, `stochtree` makes it possible to continue sampling an existing model 
 1. Continuing to run an existing BART / BCF sampler, perhaps after inspecting traceplots and deciding to run for longer or with different hyperparameters
 2. Resurrecting a BART / BCF model saved to disk or just JSON string and sampling it for longer
 
-[RFC 4](https://github.com/StochasticTree/rfcs/blob/main/0004-cpp-dispatch.md) means the R and Python routines have a much larger shared C++ core and there is a documented API for passing structured inputs / outputs to / from C++. This allows us to simplify use case 1 above, so that a `BARTModel` or `BCFModel` object retains an in-memory pointer to a C++ `BARTSamples` / `BCFSamples` object, which can be appended to by continuing a sampler (with different hyperparameters). Similarly, with more of the sampling logic in C++, we can standardize model / parameter deserialization so that the C++ samplers ingest a(n optional) JSON string and initialize model state from the provided model.
+[RFC 4](https://github.com/StochasticTree/rfcs/blob/main/0004-cpp-dispatch.md) means the R and Python routines have a much larger shared C++ core and there is a documented API for passing structured inputs / outputs to / from C++. This allows us to simplify use case 1 above, so that a `BARTModel` or `BCFModel` object retains an in-memory pointer to a C++ `BARTSamples` / `BCFSamples` object, which can be appended to by continuing a sampler (with different hyperparameters). Similarly, with the model's samples held in a persistent in-memory `BARTSamples` / `BCFSamples`, we can standardize deserialization so that R / Python reconstruct that samples object from a serialized model (reusing the existing C++ `ForestContainer` serde) and hand it to the sampler to resume — no JSON roundtrip for in-memory continuation, and no need for C++ to parse the envelope.
 
 Finally, this RFC will unlock a currently unsupported use case:
 
@@ -408,6 +408,13 @@ Keeping these three fields separate is the core idea: `schema_version` says *wha
 
 This keeps the integer meaningful and bumps rare.
 
+**Augmentation vs. a migration rung.** The two halves of the bump policy are two *different* mechanisms, and it helps to keep them distinct:
+
+* **Augmentation** handles additive drift *within* a `schema_version`: an older file simply lacks a field a newer writer adds. There is no version change and therefore no rung -- the **parser** supplies the default. As long as we hold the additive-only discipline, loading an older file is *just* augmentation and the ladder stays empty.
+* **A migration rung** (`vN -> vN+1`) handles a *non-additive* change -- a rename, removal, re-type, or structural-convention change. Augmentation cannot express these (it can default a missing `mean_forest`, but it cannot rename `forest_0` into one); the rung performs the actual key rewrite.
+
+So the parser's robust defaulting is what keeps rungs rare: anything we can change additively costs zero rungs, and forward-compatibility rests on the parser defaulting *every* optional field reliably -- not on the ladder. The sole exception at launch is `v0 -> v1` (below), which bundles all three flavors: augmentation of missing legacy fields, several rewrites (`preprocessor_metadata` -> `covariate_preprocessor`, dropping `rfx_unique_group_ids`, positional -> named forest keys), and two synthesized fields (`platform`, `cross_platform_portable`).
+
 **Reader rules.** A reader compares the loaded `schema_version` (call it `v`) against the maximum version it supports (`current`):
 
 | Loaded `v` | Action |
@@ -427,7 +434,9 @@ Rather than a parser that branches on version throughout (the pattern the field-
 json_in -> [detect schema_version] -> migrate (0 -> 1 -> 2 -> ...) -> parse(current) -> BARTSamples / BCFSamples
 ```
 
-All legacy knowledge lives in small, append-only, individually testable migration steps (each with a `vN fixture -> vN+1 fixture` unit test); the live parser stays clean and only ever sees the current schema. Bumping the schema is then "append one migration plus one golden fixture," never a rewrite of the parser. Because this RFC moves serialization into C++, migrations live in C++ so that R and Python share them.
+All legacy knowledge lives in small, append-only, individually testable migration steps (each with a `vN fixture -> vN+1 fixture` unit test); the live parser stays clean and only ever sees the current schema. Bumping the schema is then "append one migration plus one golden fixture," never a rewrite of the parser.
+
+Migrations live in **R and Python, not C++**. At 0.5.0 the ladder has exactly one rung (`v0 -> v1`, since `current = 1`), and that rung closely mirrors the default-filling and field reconciliation each language already performs on load, so a per-language implementation is the lighter path. Divergence between the two is caught by the shared, language-neutral golden fixtures -- the same fixture JSON is asserted in both languages (see [Testing schema migrations](#testing-schema-migrations)). Consolidating the ladder into a single shared C++ `migrate_json(string) -> string` remains a clean option for *later*, warranted only once the ladder grows additional rungs; it is deferred for 0.5.0.
 
 **v0 -> v1 is the platform-aware migration.** Pre-0.5.0 R and Python diverge (`preprocessor_metadata` vs `covariate_preprocessor`, the R-only `rfx_unique_group_ids`), so the v0 -> v1 step branches on platform and *is* the [Reconciliation](#reconciliation) work described above: the high-level field renames and removals, plus computing `cross_platform_portable` from the model's feature types. It does **not** unify the two native preprocessor layouts -- those stay per-platform and same-platform-only -- so the migration leaves the `covariate_preprocessor` sub-object essentially in place (renamed, not restructured). Note the circularity: `platform` is a field this RFC *introduces* in v1, so a legacy model does not carry it -- the v0 -> v1 migration is the *producer* of `platform`, not a consumer. It therefore infers the source platform from structural fingerprints in the legacy JSON (`preprocessor_metadata` present and `covariate_preprocessor` absent => R; `covariate_preprocessor` present => Python; the R-only `rfx_unique_group_ids` corroborates R), with a documented fallback discriminator for models that carry no preprocessor metadata at all. Every migration from v1 onward operates on the single unified format and is platform-agnostic.
 
@@ -670,122 +679,64 @@ Also note that we allow `num_gfr` even though it is often used to "warm-start" a
 
 Each run of `continue_sampling` appends to a model's existing `BARTSamples` / `BCFSamples` objects and updates the internal counts of `num_gfr`, `num_burnin`, and `num_mcmc`.
 
-## C++ sampler support for JSON inputs
+## Loading and continuing models from JSON
 
-BART and BCF both support sampling models reloaded from JSON in R and Python, so a full C++ overhaul of the interface must include the same logic. We propose to do this in several steps:
+BART and BCF both support reloading a serialized model to predict or to continue sampling. Consistent with the [migration ladder](#migration-ladder) decision, **envelope serialization and deserialization stay in R and Python.** C++ contributes only the pieces that genuinely live there: the existing `ForestContainer` JSON serde and a resumable in-memory `BARTSamples` / `BCFSamples`. There is no C++-owned envelope reader/writer and no JSON-ingesting sampler constructor.
 
-### Version and platform inference in C++
+### Version and platform inference
 
-We have R and Python helpers to infer the version number of a stochtree model based on its JSON representaiton and we need to extend this to C++ and add platform inference. The proposed API:
-
-```cpp
-std::string infer_stochtree_version(std::string& json_string)
-std::string infer_stochtree_platform(std::string& json_string)
-```
-
-### End-to-end JSON serialization and deserialization in C++
-
-This RFC necessitates several C++-specific serialization changes:
-
-1. Routines that can unpack a JSON file into model state in a `BARTSampler` / `BCFSampler` class, to support the `previous_model_json` interface in BART and BCF
-2. Routines that write model components from a `BARTSampler` / `BCFSampler` class to a JSON object in the schema outlined above
-3. Routines that read a JSON object in the schema outlined above and construct write an appropriate `BARTSampler` / `BCFSampler` class
-
-#### JSON to sampler deserialization
-
-Right now, we initialize `BARTSampler` / `BCFSampler` classes with a single constructor that calls an `InitializeState` method. We propose to overload this API to allow for initialization from JSON
-
-```cpp
-class BARTSampler {
- public:
-  BARTSampler(BARTSamples& samples, BARTConfig& config, BARTData& data);
-  BARTSampler(nlohmann::json& json, BARTSamples& samples, BARTConfig& config, BARTData& data);
- private:
-  void InitializeState(BARTSamples& samples);
-  void InitializeState(nlohmann::json& json, BARTSamples& samples);
-}
-
-class BCFSampler {
- public:
-  BCFSampler(BCFSamples& samples, BCFConfig& config, BCFData& data);
-  BCFSampler(nlohmann::json& json, BCFSamples& samples, BCFConfig& config, BCFData& data);
- private:
-  void InitializeState(BCFSamples& samples);
-  void InitializeState(nlohmann::json& json, BCFSamples& samples);
-}
-```
-
-#### Writing to JSON from `BARTSamples` / `BCFSamples`
-
-Here, the primary change is that we replace serialization logic in R / Python like
+The existing R and Python helpers that infer a model's version from its JSON are retained (and extended to also report `platform`); they do not move to C++.
 
 ```r
-if (object$model_params$include_mean_forest) {
-  jsonobj$add_forest(object$mean_forests)
-}
-if (object$model_params$include_variance_forest) {
-  jsonobj$add_forest(object$variance_forests)
-}
+inferStochtreeVersion(json)     # R
+inferStochtreePlatform(json)
+```
+```python
+_infer_stochtree_version(json)  # Python
+_infer_stochtree_platform(json)
 ```
 
-With a single C++ function that writes to a JSON reference based on a `BARTSamples` / `BCFSamples` object
+### Writing the envelope (R / Python)
 
-```cpp
-static inline void writeJSON(nlohmann::json& json, BARTSamples& samples) {
-  if (samples.mean_forests != nullptr) {
-    json.at("forests").emplace("mean_forest", samples.mean_forests->to_json());
-  }
-  if (samples.variance_forests != nullptr) {
-    json.at("forests").emplace("variance_forest", samples.variance_forests->to_json());
-  }
-  // ...
-}
-```
-
-Both the R and Python interfaces will create this JSON object and then call a wrapper around this C++ serialization function
-
-#### Creating `BARTSamples` / `BCFSamples` from JSON
-
-As above, we replace R / Python deserialization logic like
+R and Python assemble the unified envelope themselves. The only forest-specific logic is a call to the existing C++ `ForestContainer` serializer, now keyed by self-describing names. So today's
 
 ```r
-if (include_mean_forest) {
-  output[["mean_forests"]] <- loadForestContainerJson(
-    json_object,
-    "forest_0"
-  )
-  if (include_variance_forest) {
-    output[["variance_forests"]] <- loadForestContainerJson(
-      json_object,
-      "forest_1"
-    )
-  }
-} else {
-  output[["variance_forests"]] <- loadForestContainerJson(
-    json_object,
-    "forest_0"
-  )
-}
+if (object$model_params$include_mean_forest) jsonobj$add_forest(object$mean_forests)
+if (object$model_params$include_variance_forest) jsonobj$add_forest(object$variance_forests)
 ```
 
-With a single C++ function that writes to `BARTSamples` / `BCFSamples` object based on JSON
+becomes the same calls writing under named keys (`mean_forest` / `variance_forest`), alongside the scalar metadata, the parameter samples read from the held `BARTSamples` / `BCFSamples`, and the language's **native** `covariate_preprocessor` sub-object plus its portability header. The native preprocessor is serialized by the language that owns it (see [Covariate Preprocessor](#covariate-preprocessor)); C++ never sees it.
+
+### Reading the envelope and reconstructing samples (R / Python)
+
+On read, R / Python:
+
+1. run the [migration ladder](#migration-ladder) to bring the JSON up to `current`,
+2. enforce the cross-platform gate (`platform` mismatch and `cross_platform_portable == false` => error),
+3. load each forest via the existing `loadForestContainerJson`, now addressed by named key rather than position —
+
+```r
+# named keys remove the need to branch on which forests are present
+mean_forests <- loadForestContainerJson(json_object, "mean_forest")          # if include_mean_forest
+variance_forests <- loadForestContainerJson(json_object, "variance_forest")  # if include_variance_forest
+```
+
+4. rebuild the native preprocessor (same-platform) or a trivial identity preprocessor (cross-platform numeric, foreign body ignored), and
+5. populate an in-memory `BARTSamples` / `BCFSamples` from the loaded forest containers and parameter arrays.
+
+Step 5 is the one new piece of C++ surface: a way to **populate** a samples object from externally-supplied forest containers and parameter vectors (the "some copying / moving of pointers" cost), reusing the structured-input patterns from the R/Python binding design. The forest containers are already C++ objects; the samples object just takes ownership of them and the parameter arrays.
+
+### Continuing from a reconstructed model
+
+Because the sampler operates on an in-memory `BARTSamples` / `BCFSamples`, no JSON-aware sampler is needed and the constructor signature is unchanged:
 
 ```cpp
-static inline void readJSON(nlohmann::json& json, BARTSamples& samples) {
-  // Named keys remove the need to branch on which forests are present
-  if (json.at("include_mean_forest")) {
-    samples.mean_forests->Reset();
-    samples.mean_forests->from_json(json.at("forests").at("mean_forest"));
-  }
-  if (json.at("include_variance_forest")) {
-    samples.variance_forests->Reset();
-    samples.variance_forests->from_json(json.at("forests").at("variance_forest"));
-  }
-  // ...
-}
+BARTSampler(BARTSamples& samples, BARTConfig& config, BARTData& data);
+BCFSampler(BCFSamples& samples, BCFConfig& config, BCFData& data);
 ```
 
-Both the R and Python interfaces will create this JSON object and then call a wrapper around this C++ serialization function
+- **In-memory continuation** operates directly on the model's held samples object (and resumes its RNG stream — see [Continued sampling](#continued-sampling)).
+- **From-disk continuation** (`previous_model_json`) is *read → populate samples → resume*: the JSON ingestion happens in R / Python (above), then the sampler runs on the reconstructed in-memory object. A freshly deserialized model carries no RNG state, so its continuation starts a new stream (consistent with the deserialized-continuation caveat noted earlier).
 
 ## Predicting from serialized models
 
